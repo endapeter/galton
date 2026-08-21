@@ -7,10 +7,19 @@
 #     CPU loop.
 #   - np.roots (used on the CPU for the quartic time-to-peg-impact polynomial)
 #     is not available inside CUDA kernels. It is replaced by an in-kernel
-#     Durand-Kerner complex root iteration (_quartic_smallest_root).
-#   - The per-thread "seen pegs" dedup array from the CPU version is dropped:
-#     it is only a performance optimization, and re-testing a duplicate peg
-#     yields the same root, so the minimum is unchanged.
+#     closed-form (Ferrari) quartic solver (_quartic_smallest_root). That is
+#     ~200 double-precision flops with no data-dependent iteration, versus
+#     ~13k flops for an iterative complex-arithmetic root finder - which
+#     matters a lot because consumer GeForce GPUs execute float64 at 1/64th
+#     of the float32 rate, so an iterative float64 solver dominates the
+#     kernel time otherwise. Candidate roots get two Newton polish steps on
+#     the original polynomial to recover full double accuracy.
+#   - The spatial grid stores each peg in exactly ONE cell (the cell
+#     containing its center). Queries expand their swept bounding box by the
+#     peg radius, so every reachable peg is still found - but, unlike
+#     multi-cell registration, no peg is ever tested twice. This replaces the
+#     per-thread "seen pegs" dedup array of the CPU version, which would need
+#     per-thread local memory on the device.
 #   - Rendering (histogram, Q-Q plot, verification walk) stays on the CPU with
 #     matplotlib.
 #
@@ -69,6 +78,12 @@ def build_spatial_grid(circles_centers, radius, cell_size):
     """
     Creates dense 2D index arrays for O(1) local lookups:
     grid_data[x_cell, y_cell, k] = circle index (or -1), grid_counts[x_cell, y_cell] = n.
+
+    Each peg is registered in exactly ONE cell: the cell containing its
+    center. Consumers query the grid over a swept bounding box expanded by
+    `radius`, so any peg whose disk can touch the sweep is still found, and
+    no peg is ever returned twice (this is the device-side replacement for
+    the CPU version's "seen pegs" dedup array).
     """
     if len(circles_centers) == 0:
         return np.zeros((1, 1, 1), dtype=np.int32), np.zeros((1, 1), dtype=np.int32), 0, 0
@@ -93,116 +108,156 @@ def build_spatial_grid(circles_centers, radius, cell_size):
 
     for i in range(len(circles_centers)):
         xc, yc = circles_centers[i]
-        c_min_x = int(np.floor((xc - radius) / cell_size))
-        c_max_x = int(np.floor((xc + radius) / cell_size))
-        c_min_y = int(np.floor((yc - radius) / cell_size))
-        c_max_y = int(np.floor((yc + radius) / cell_size))
-
-        for cx in range(c_min_x, c_max_x + 1):
-            for cy in range(c_min_y, c_max_y + 1):
-                idx_x = cx - min_cx
-                idx_y = cy - min_cy
-                count = grid_counts[idx_x, idx_y]
-                if count < max_pegs:
-                    grid_data[idx_x, idx_y, count] = i
-                    grid_counts[idx_x, idx_y] += 1
+        idx_x = int(np.floor(xc / cell_size)) - min_cx
+        idx_y = int(np.floor(yc / cell_size)) - min_cy
+        count = grid_counts[idx_x, idx_y]
+        if count < max_pegs:
+            grid_data[idx_x, idx_y, count] = i
+            grid_counts[idx_x, idx_y] = count + 1
 
     return grid_data, grid_counts, min_cx, min_cy
 
 
 # --- DEVICE-SIDE QUARTIC SOLVER (replaces np.roots inside the kernel) ---
 @cuda.jit(device=True, inline=True)
+def _cbrt(x):
+    if x >= 0.0:
+        return x ** (1.0 / 3.0)
+    return -((-x) ** (1.0 / 3.0))
+
+
+@cuda.jit(device=True, inline=True)
+def _newton_polish(c4, c3, c2, c1, c0, t):
+    """Refine an approximate root with two Newton steps on the quartic."""
+    for _ in range(2):
+        f = (((c4 * t + c3) * t + c2) * t + c1) * t + c0
+        fp = ((4.0 * c4 * t + 3.0 * c3) * t + 2.0 * c2) * t + c1
+        if fp == 0.0:
+            break
+        step = f / fp
+        t = t - step
+        if abs(step) < 1e-14 * (1.0 + abs(t)):
+            break
+    return t
+
+
+@cuda.jit(device=True, inline=True)
+def _try_root(c4, c3, c2, c1, c0, t, t_lower, t_upper, best):
+    """Keep t if it is a real root in (t_lower, t_upper) smaller than best."""
+    # NaN candidates (degenerate coefficients) fail every comparison and are
+    # dropped here, so numerical garbage can never become a collision time.
+    if not (t_lower < t < t_upper):
+        return best
+    t = _newton_polish(c4, c3, c2, c1, c0, t)
+    if not (t_lower < t < t_upper):
+        return best
+    if best < 0.0 or t < best:
+        return t
+    return best
+
+
+@cuda.jit(device=True, inline=True)
 def _quartic_smallest_root(c4, c3, c2, c1, c0, t_lower, t_upper):
     """
     Smallest real root of c4*t^4 + c3*t^3 + c2*t^2 + c1*t + c0 = 0 lying in
     the open interval (t_lower, t_upper). Returns the root, or -1.0 if none.
 
-    Durand-Kerner (Weierstrass) iteration on the monic quartic, converging
-    quadratically once the roots separate (typically < 15 of the 40 steps).
+    Closed-form solution: normalize to monic, depress the quartic
+    (t = u - a/4 -> u^4 + p*u^2 + q*u + r), solve the resolvent cubic
+    (Cardano / trigonometric branch on its discriminant) for its largest real
+    root z >= 0, and factor into two real quadratics via alpha = sqrt(z).
+    Each candidate is Newton-polished on the original polynomial, so the
+    closed-form round-off (worst near double roots) is recovered.
 
-    The four roots are kept in scalar locals (registers). A cuda.local.array
-    would spill to per-thread local memory, which is latency-bound and slows
-    the kernel down by orders of magnitude at low occupancy.
+    All arithmetic is real float64: no iteration whose trip count depends on
+    the data (an earlier Durand-Kerner port cost ~13k flops per call and, at
+    the 1/64 float64 rate of consumer GPUs, dominated the whole kernel).
     """
-    # Normalize to monic: t^4 + a*t^3 + b*t^2 + c*t + d
     a = c3 / c4
     b = c2 / c4
     c = c1 / c4
     d = c0 / c4
 
-    # Standard starting guesses: (0.4 + 0.9j)^k, k = 0..3 (distinct, off the axes)
-    r0 = 1.0 + 0.0j
-    r1 = 0.4 + 0.9j
-    r2 = r1 * r1
-    r3 = r2 * r1
+    # Depressed quartic: t = u - a/4  ->  u^4 + p*u^2 + q*u + r
+    a2 = a * a
+    p = b - 0.375 * a2                       # b - 3*a^2/8
+    q = 0.125 * a * a2 - 0.5 * a * b + c     # a^3/8 - a*b/2 + c
+    r = -0.01171875 * a2 * a2 + 0.0625 * a2 * b - 0.25 * a * c + d
 
-    for _ in range(40):
-        delta = 0.0
+    # Resolvent cubic: z^3 + 2p*z^2 + (p^2 - 4r)*z - q^2 = 0.
+    # Its largest real root is always >= 0 for a real-coefficient quartic.
+    A = 2.0 * p
+    B = p * p - 4.0 * r
+    C = -q * q
+    P = B - A * A / 3.0                      # depressed cubic w^3 + P*w + Q
+    Q = 2.0 * A * A * A / 27.0 - A * B / 3.0 + C
+    disc = 0.25 * Q * Q + (P * P * P) / 27.0
 
-        p = r0
-        f = ((p * p + a * p + b) * p + c) * p + d
-        den = (p - r1) * (p - r2) * (p - r3)
-        if abs(den) > 1e-300:
-            st = f / den
-            r0 = p - st
-            m = abs(st)
-            if m > delta:
-                delta = m
-
-        p = r1
-        f = ((p * p + a * p + b) * p + c) * p + d
-        den = (p - r0) * (p - r2) * (p - r3)
-        if abs(den) > 1e-300:
-            st = f / den
-            r1 = p - st
-            m = abs(st)
-            if m > delta:
-                delta = m
-
-        p = r2
-        f = ((p * p + a * p + b) * p + c) * p + d
-        den = (p - r0) * (p - r1) * (p - r3)
-        if abs(den) > 1e-300:
-            st = f / den
-            r2 = p - st
-            m = abs(st)
-            if m > delta:
-                delta = m
-
-        p = r3
-        f = ((p * p + a * p + b) * p + c) * p + d
-        den = (p - r0) * (p - r1) * (p - r2)
-        if abs(den) > 1e-300:
-            st = f / den
-            r3 = p - st
-            m = abs(st)
-            if m > delta:
-                delta = m
-
-        if delta < 1e-12:
-            break
+    if disc >= 0.0:
+        # One real root (Cardano); real cube roots handle negative arguments.
+        sq = math.sqrt(disc)
+        z = _cbrt(-0.5 * Q + sq) + _cbrt(-0.5 * Q - sq) - A / 3.0
+    else:
+        # Three real roots; the largest is the k = 0 trigonometric branch.
+        m = 2.0 * math.sqrt(-P / 3.0)
+        arg = (3.0 * Q / (2.0 * P)) * math.sqrt(-3.0 / P)
+        if arg > 1.0:
+            arg = 1.0
+        elif arg < -1.0:
+            arg = -1.0
+        z = m * math.cos(math.acos(arg) / 3.0) - A / 3.0
 
     best = -1.0
-    r = r0
-    if abs(r.imag) < 1e-6:
-        t_val = r.real
-        if t_lower < t_val < t_upper and (best < 0.0 or t_val < best):
-            best = t_val
-    r = r1
-    if abs(r.imag) < 1e-6:
-        t_val = r.real
-        if t_lower < t_val < t_upper and (best < 0.0 or t_val < best):
-            best = t_val
-    r = r2
-    if abs(r.imag) < 1e-6:
-        t_val = r.real
-        if t_lower < t_val < t_upper and (best < 0.0 or t_val < best):
-            best = t_val
-    r = r3
-    if abs(r.imag) < 1e-6:
-        t_val = r.real
-        if t_lower < t_val < t_upper and (best < 0.0 or t_val < best):
-            best = t_val
+
+    if z > 0.0:
+        # Factor: (u^2 + alpha*u + beta) * (u^2 - alpha*u + gamma)
+        alpha = math.sqrt(z)
+        if alpha > 0.0:
+            qa = q / alpha
+        else:
+            qa = 0.0
+        s = p + z
+        beta = 0.5 * (s - qa)
+        gamma = 0.5 * (s + qa)
+
+        # u^2 + alpha*u + beta = 0
+        d1 = alpha * alpha - 4.0 * beta
+        if d1 >= 0.0:
+            sq1 = math.sqrt(d1)
+            best = _try_root(c4, c3, c2, c1, c0, -0.5 * (alpha - sq1) - 0.25 * a,
+                             t_lower, t_upper, best)
+            best = _try_root(c4, c3, c2, c1, c0, -0.5 * (alpha + sq1) - 0.25 * a,
+                             t_lower, t_upper, best)
+
+        # u^2 - alpha*u + gamma = 0
+        d2 = alpha * alpha - 4.0 * gamma
+        if d2 >= 0.0:
+            sq2 = math.sqrt(d2)
+            best = _try_root(c4, c3, c2, c1, c0, 0.5 * (alpha - sq2) - 0.25 * a,
+                             t_lower, t_upper, best)
+            best = _try_root(c4, c3, c2, c1, c0, 0.5 * (alpha + sq2) - 0.25 * a,
+                             t_lower, t_upper, best)
+    else:
+        # z <= 0 only through round-off when q ~ 0: the quartic is
+        # effectively biquadratic, u^4 + p*u^2 + r = 0.
+        dw = p * p - 4.0 * r
+        if dw >= 0.0:
+            sqw = math.sqrt(dw)
+            w1 = -0.5 * (p + sqw)           # u^2 = w
+            w2 = -0.5 * (p - sqw)
+            if w1 >= 0.0:
+                u = math.sqrt(w1)
+                best = _try_root(c4, c3, c2, c1, c0, u - 0.25 * a,
+                                 t_lower, t_upper, best)
+                best = _try_root(c4, c3, c2, c1, c0, -u - 0.25 * a,
+                                 t_lower, t_upper, best)
+            if w2 >= 0.0:
+                u = math.sqrt(w2)
+                best = _try_root(c4, c3, c2, c1, c0, u - 0.25 * a,
+                                 t_lower, t_upper, best)
+                best = _try_root(c4, c3, c2, c1, c0, -u - 0.25 * a,
+                                 t_lower, t_upper, best)
+
     return best
 
 
@@ -210,7 +265,7 @@ def _quartic_smallest_root(c4, c3, c2, c1, c0, t_lower, t_upper):
 @cuda.jit
 def simulate_trajectory_cuda(circles_centers, grid_data, grid_counts,
                              min_cx, min_cy, cell_size, radius,
-                             x_inits, final_x, status, step_counts, peg_tests,
+                             x_inits, final_x, status,
                              e, y_target, wall_distance, g):
     ball = cuda.grid(1)
     if ball >= x_inits.shape[0]:
@@ -224,7 +279,6 @@ def simulate_trajectory_cuda(circles_centers, grid_data, grid_counts,
     grid_w = grid_counts.shape[0]
     grid_h = grid_counts.shape[1]
 
-    n_peg_tests = 0
     step = 0
     while step <= 1000:
         step += 1
@@ -288,8 +342,9 @@ def simulate_trajectory_cuda(circles_centers, grid_data, grid_counts,
         min_t_circle = math.inf
         next_peg_idx = -1
 
-        # 4. Local analytical scanning loop (no seen-peg dedup needed: repeated
-        #    pegs recompute the same roots, so the minimum is unchanged).
+        # 4. Local analytical scanning loop. The grid stores each peg in
+        #    exactly one cell (see build_spatial_grid), so every peg in the
+        #    expanded swept box is tested exactly once - no dedup needed.
         for cx in range(cx_start, cx_end + 1):
             for cy in range(cy_start, cy_end + 1):
                 idx_x = cx - min_cx
@@ -385,7 +440,10 @@ def simulate_batch_cuda(circles_centers, grid_data, grid_counts, min_cx, min_cy,
     d_final = cuda.device_array(n_balls, dtype=np.float64)
     d_status = cuda.device_array(n_balls, dtype=np.int32)
 
-    threads_per_block = 256
+    # Small blocks: a 2000-ball frame is only ~32 blocks of 64 threads, which
+    # already under-fills the GPU's SMs - 256-thread blocks would leave even
+    # more of the device idle at these problem sizes.
+    threads_per_block = 64
     blocks = (n_balls + threads_per_block - 1) // threads_per_block
 
     start = time.perf_counter()
