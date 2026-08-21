@@ -35,17 +35,28 @@ The project investigates the Galton board as a physical random-process generator
 Secondary questions recorded in the notes: ball–ball interactions, finite-size ball/peg effects,
 sand-vs-bead scaling, and the relationship between funnel size and grid proportionality.
 
-### Concrete experiment backlog (from `notes.txt`)
+### Concrete experiment backlog (from `notes.txt`, priorities set 2026-08-21)
+
+**Active queue (detailed in section 7, steps 6-9):**
+
+- [ ] R² vs. peg radius, iterated over an increasing peg-distance sweep - one curve per
+      distance value (section 7, step 6).
+- [ ] σ(output) vs. funnel width - **the sweep currently configured** in `galton_cuda.py`;
+      needs only the aggregation into one static figure (section 7, step 7).
+- [ ] σ(output) vs. σ(input), feeding a **Gaussian** input through the widest funnel,
+      side-by-side figure with both σ visually highlighted and printed numerically on the
+      image (section 7, step 8).
+- [ ] Brownian-motion modeling: represent the horizontal motion as 1-D Brownian motion,
+      estimate the effective diffusion coefficient, compare against the diffusion
+      prediction (section 7, step 9).
+
+**Backlog:**
 
 - [ ] Reproduce the arcsine-law curve from the reference paper; explain the gaps in the distribution.
-- [ ] σ(output) vs. funnel width — **this is the sweep currently configured** in `galton_cuda.py`.
-- [ ] σ(output) vs. σ(input), feeding a Gaussian input through a wide funnel.
-- [ ] Radial-parameter sweeps: R² vs. peg radius, animated over peg distance; also ball radius.
 - [ ] `changing_rad.gif` re-run with higher restitution *e* and a narrow funnel.
 - [ ] Variance vs. bin-resolution / ball-count matrix (finite- vs infinite-variance signature).
-- [ ] Brownian analysis: RMS horizontal displacement vs. board length.
-- [ ] Vibration experiments (moving pegs) — requires per-frame spatial-grid rebuilds.
-- [ ] Ball–ball interactions — breaks the one-thread-per-ball independence assumption.
+- [ ] Vibration experiments (moving pegs) - requires per-frame spatial-grid rebuilds.
+- [ ] Ball-ball interactions - breaks the one-thread-per-ball independence assumption.
 
 ---
 
@@ -74,19 +85,24 @@ sand-vs-bead scaling, and the relationship between funnel size and grid proporti
 - A **parameter-sweep → animation-frame pipeline**: for each sweep value the engine emits a
   histogram, a Q-Q plot with normality metrics, a raw-data CSV, and a single-ball verification
   trajectory figure, all indexed by frame number.
-- The GPU port is complete in structure: one CUDA thread per ball, whole frame = one kernel
-  launch, with an in-kernel Durand–Kerner quartic solver replacing `np.roots`.
+- The GPU port **runs**: one CUDA thread per ball, whole frame = one kernel launch. Two
+  problems were fixed in commit `b5dfc5c`: the dead kernel-signature instrumentation that
+  raised `TypeError` at the first launch, and the Durand–Kerner quartic solver, which was
+  replaced by a closed-form Ferrari/Cardano solution (see section 4).
 - Docker tooling for Windows + WSL2 with GPU passthrough, including smoke-test knobs
-  (`GALTON_BALLS`, `GALTON_INTERVALS`).
+  (`GALTON_BALLS`, `GALTON_INTERVALS`), documented in `CUDA_GUIDE.md`.
 
-### Known issue (blocking the GPU engine as committed)
+### Status update (2026-08-21)
 
-`galton_cuda.py` declares the kernel with 16 parameters — the signature at
-`galton_cuda.py:211-214` includes `step_counts, peg_tests` (apparent work-in-progress
-instrumentation; `n_peg_tests` at line 227 is also computed but never stored) — but the only
-launch site (`galton_cuda.py:392-396`) passes **14 arguments**. Numba will raise a
-`TypeError` at the first kernel launch until the two dead parameters are removed from the
-signature or the arrays are actually allocated and passed.
+- The kernel-signature mismatch previously documented here (dead `step_counts`/`peg_tests`
+  parameters raising `TypeError` at the first kernel launch) is **fixed** - removed in
+  commit `b5dfc5c`.
+- **Current blocker (host-side, not code):** `docker build -t galton-cuda .` fails at the
+  base-image pull with `lookup registry-1.docker.io: no such host`. The Windows host itself
+  resolves and reaches Docker Hub fine; the failure is inside Docker Desktop's VM, whose DNS
+  forwarding cannot reach the host's IPv6 link-local DNS server (`fe80::...`, likely a
+  router/VPN adapter). **Fix:** Docker Desktop -> Settings -> Resources -> Network ->
+  DNS Server = `8.8.8.8,1.1.1.1`, Apply & restart, then rebuild. No project changes needed.
 
 ### What remains open (relative to the goals)
 
@@ -163,29 +179,37 @@ galton/
   solvers, the peg search, and the reflection math — runs *on the device*. A whole frame of
   `n_balls` trajectories is therefore a **single kernel launch**, replacing the sequential
   per-ball CPU loop of `galton_ultra.py`.
-- Launch configuration: `threads_per_block = 256`, `blocks = ceil(n_balls / 256)`
-  (`galton_cuda.py:388-389`). Threads beyond `n_balls` exit immediately.
+- Launch configuration: `threads_per_block = 64`, `blocks = ceil(n_balls / 64)`
+  (`galton_cuda.py:446-447`). Threads beyond `n_balls` exit immediately.
 - Work distribution is trivially parallel because balls do not interact — which is precisely
   why ball–ball interaction remains an open research item.
 
 ### The device-side quartic solver
 
 `np.roots` does not exist inside CUDA kernels, so the time-to-peg-impact quartic is solved by
-`_quartic_smallest_root` (`galton_cuda.py:114-206`) using **Durand–Kerner (Weierstrass)**
-simultaneous complex iteration:
+`_quartic_smallest_root` (`galton_cuda.py:159-261`) **in closed form**. It was rewritten in
+commit `b5dfc5c` after the original Durand–Kerner port was found to dominate kernel time:
+an iterated complex solver costs ~13k flops per call with a *data-dependent trip count*,
+ruinous at the 1/64 float64 rate of consumer GPUs. The current algorithm:
 
-- The quartic is normalized to monic form; the four root estimates start at `(0.4+0.9j)^k`.
-- Up to 40 iterations with quadratic convergence once roots separate; early exit when the max
-  update step `< 1e-12` (typically converges in fewer than 15 steps).
-- The four roots are held in **scalar locals (registers)**, deliberately *not*
-  `cuda.local.array` — per the code comment, a local array would spill to per-thread local
-  memory, which is latency-bound and "slows the kernel down by orders of magnitude at low
-  occupancy".
-- After iteration, roots with `|imag| < 1e-6` are accepted as real; the smallest one lying in
-  the open interval `(t_lower, t_upper)` is returned, or `-1.0` if none. The upper bound is the
-  current best collision time, so the search is progressively self-pruning.
+- Normalize to monic, depress the quartic (`t = u − a/4` -> `u⁴ + p·u² + q·u + r`).
+- Solve the resolvent cubic `z³ + 2p·z² + (p² − 4r)·z − q² = 0` for its **largest real root**
+  (always ≥ 0 for real coefficients): Cardano when the discriminant ≥ 0, otherwise the
+  trigonometric `k = 0` branch for three-real-root cases; real cube roots handle negative
+  arguments (`_cbrt`).
+- With `α = √z`, factor into two real quadratics `(u² + αu + β)(u² − αu + γ)`; each
+  contributes up to two candidate roots. (`z ≤ 0` occurs only through round-off when
+  `q ≈ 0` - the quartic is then effectively biquadratic and solved directly.)
+- Each candidate passes through `_try_root` -> `_newton_polish`
+  (`galton_cuda.py:129-156`): a Newton step on the original polynomial recovers
+  closed-form round-off (worst near double roots), then the root must lie in the open
+  interval `(t_lower, t_upper)`. NaN candidates from degenerate coefficients fail every
+  comparison and are dropped, so numerical garbage can never become a collision time.
+  The smallest surviving root wins, or `-1.0` if none. The upper bound is the current best
+  collision time, so the search is progressively self-pruning.
+- All arithmetic is real float64 with **no data-dependent iteration** anywhere.
 
-### Per-batch data flow (`simulate_batch_cuda`, `galton_cuda.py:371-403`)
+### Per-batch data flow (`simulate_batch_cuda`, `galton_cuda.py:426-463`)
 
 1. Host allocates device arrays and uploads inputs:
    `cuda.to_device` for `circles_centers`, `grid_data`, `grid_counts`, `x_inits`; device-side
@@ -314,7 +338,7 @@ These are pipeline-level observations that dwarf the Docker overhead above:
 This is the end-to-end control flow of `galton_cuda.py` per sweep frame. Default parameters
 shown; `GALTON_BALLS` / `GALTON_INTERVALS` environment variables trim the run for smoke tests.
 
-### Stage 0 — Sweep configuration (`__main__`, `galton_cuda.py:775-805`)
+### Stage 0 — Sweep configuration (`__main__`, `galton_cuda.py:833-919`)
 
 ```
 params = {
@@ -371,7 +395,7 @@ Each thread runs the following loop (max 1 000 iterations) for its ball, with
    solve the **quartic** in t obtained from `|p(t) − c|² = radius²` with
    `p(t) = p₀ + v·t − ½g·t²ŷ` (coefficients `c4 = g²/4, c3 = −vy·g, c2 = vx²+vy²−dy·g,
    c1 = 2(dx·vx+dy·vy), c0 = dx²+dy²−r²`), keeping the smallest real root in
-   `(1e-5, current best)` via the Durand–Kerner device solver.
+   `(1e-5, current best)` via the closed-form device solver.
 4. **Earliest event wins** among {line, peg, wall}:
    - **Detection line (event 0):** record `final_x = x_next`, set `status = 1`, thread returns.
    - **Peg (event 1):** specular reflection with restitution `e = 0.1`:
@@ -416,32 +440,66 @@ ImageMagick) happens outside this repo.
 
 ---
 
-## 7. Proposed Next Steps
+## 7. Next Steps
 
 **Infrastructure (small, unblocks everything):**
 
-1. Fix the `step_counts`/`peg_tests` kernel-signature mismatch in `galton_cuda.py` (or finish
-   wiring the instrumentation) — currently the first launch raises `TypeError`.
+1. Fix Docker Desktop DNS (see the status update in section 2) - set the DNS server to
+   `8.8.8.8,1.1.1.1` in Settings -> Resources -> Network, restart, rebuild the image. Until
+   then no GPU run is possible on this machine.
 2. Slim the image: `base` + `cuda-nvcc-12-4` + `cuda-nvvm-12-4` (D1).
-3. Pin `requirements.txt` (and add `numba-cuda` if needed) — commit a `pip freeze` (D2).
+3. Pin `requirements.txt` (and add `numba-cuda` if needed) - commit a `pip freeze` (D2).
 4. Persist Numba/matplotlib caches via mounted volumes (D3); add `.git` to `.dockerignore` (D5).
 5. Env-gate the verification walk so production sweeps skip the slow pure-Python stage.
 
-**Science (in the order the notes suggest):**
+**Science - immediate experiment queue (priority order):**
 
-6. Finish the funnel-width sweep analysis: extract σ(output) and R² per frame from the CSVs the
-   current sweep already produces; plot σ vs. funnel width (goal 5a).
-7. Gaussian-input experiment: replace the uniform drop window with `N(0, σ_in)` and sweep
-   σ_in → σ_out (goal 5b).
-8. Radial-parameter sweeps: R² vs. peg radius animated over peg spacing; re-run
-   `changing_rad.gif` at higher `e` with a narrow funnel.
-9. Reproduce the arcsine-law curve from the reference paper and explain the gaps (goal 3).
-10. Variance-convergence vs. bin-resolution matrix — the finite/infinite-variance fingerprint
+6. **R² of normality vs. peg radius, iterated over peg distance.** For each value of peg
+   spacing `DISTANCE` in an increasing sweep, sweep `RADIUS` and extract the Q-Q normality
+   R² for every (distance, radius) pair, then plot **one R²-vs-radius curve per distance
+   value** on shared axes, with distance as the legend/colorbar parameter. This is a nested
+   two-parameter sweep replacing the current single `SWEEP_PARAM` (the per-frame machinery -
+   Q-Q plot, R² annotation, CSV - already exists; the new work is the 2-D sweep controller
+   and an aggregation script that collects the per-frame R² values into one summary
+   figure). Question answered: how peg size and gap size *jointly* shape the normality of
+   the output distribution.
+
+7. **σ(output) vs. funnel width - one static figure.** The currently configured
+   `X_DROP_RANGE` sweep already produces the data: read each frame's CSV, compute σ of the
+   successful `final_x` values, and plot σ against the funnel half-width (drop window
+   `(-v, +v)`). A single image, no animation, no new simulation needed beyond one full run
+   of the existing sweep (goal 5a).
+
+8. **Gaussian input through the widest funnel - side-by-side σ comparison figure.** Change
+   the Stage-3 sampling from `x ~ U(-v, +v)` to `x ~ N(0, σ_in)`, keep the funnel at its
+   widest (sweep maximum, 47.0), and emit **one figure with two panels side by side**:
+   left = the *input* distribution (histogram of the sampled Gaussian drop positions with
+   the Gaussian curve overlaid), right = the *output* distribution (histogram of `final_x`).
+   Both panels visually highlight one standard deviation (a shaded ±σ band about the mean)
+   **and print the numerical σ value as text on the image**, so the input-σ -> output-σ
+   relationship can be read directly off the figure. First concrete data point for goal 5b.
+
+9. **1-D Brownian-motion modeling - begin the mathematical representation.** Frame the
+   motion analytically: vertical descent plays the role of time, horizontal displacement is
+   a 1-D random walk driven by peg impacts. First steps:
+   - Estimate the effective diffusion coefficient D from existing per-ball CSVs via
+     `E[(Δx)²] = 2·D·t`, with t proportional to board length / number of peg rows crossed.
+   - Compare the observed output distribution against the diffusion prediction
+     `N(0, √(2·D·t))`.
+   - Record where the i.i.d.-steps assumption behind the diffusion limit breaks (e.g. peg
+     radius comparable to the gap, or a funnel so wide that the initial x dominates).
+   - Literature pass: Galton-board-as-Brownian-motion references (goal 6).
+
+**Science - longer term:**
+
+10. Reproduce the arcsine-law curve from the reference paper and explain the gaps (goal 3).
+11. Variance-convergence vs. bin-resolution matrix - the finite/infinite-variance fingerprint
     (goal 7); the archived `galton_variance.py` is the starting point, now GPU-accelerated.
-11. Brownian analysis: RMS horizontal displacement vs. board length (goal 6).
-12. Vibration experiments — requires rethinking the static spatial grid (rebuild per frame or
+12. Re-run `changing_rad.gif` at higher restitution *e* with a narrow funnel (reuses the
+    radius sweep from step 6).
+13. Vibration experiments - requires rethinking the static spatial grid (rebuild per frame or
     analytic moving-peg solvers) and adds resonance/mean-free-time diagnostics (goal 4).
-13. Ball–ball interactions — the largest architectural change; breaks thread independence,
+14. Ball-ball interactions - the largest architectural change; breaks thread independence,
     likely needs batched time-stepping or a different decomposition.
 
 ---
@@ -452,14 +510,14 @@ ImageMagick) happens outside this repo.
 |---|---|
 | Research questions | `problem.txt` |
 | Research log / to-dos | `notes.txt` |
-| GPU kernel (one thread per ball) | `galton_cuda.py:210-367` |
-| Device quartic solver (Durand–Kerner) | `galton_cuda.py:114-206` |
-| Batch launcher / device transfers | `galton_cuda.py:371-403` |
-| Geometry generation | `galton_cuda.py:41-64` (both engines) |
-| Spatial hash build | `galton_cuda.py:68-110` |
-| Verification walk (CPU) | `galton_cuda.py:407-612` |
-| Q-Q plot generation | `galton_cuda.py:616-668` |
-| Per-frame orchestration | `galton_cuda.py:672-771` |
-| Sweep controller | `galton_cuda.py:775-863` |
+| GPU kernel (one thread per ball) | `galton_cuda.py:265-424` |
+| Device quartic solver (closed-form Ferrari/Cardano) | `galton_cuda.py:122-261` |
+| Batch launcher / device transfers | `galton_cuda.py:426-463` |
+| Geometry generation | `galton_cuda.py:50-75` (both engines) |
+| Spatial hash build | `galton_cuda.py:77-118` |
+| Verification walk (CPU) | `galton_cuda.py:465-672` |
+| Q-Q plot generation | `galton_cuda.py:674-728` |
+| Per-frame orchestration | `galton_cuda.py:730-831` |
+| Sweep controller | `galton_cuda.py:833-919` |
 | CPU predecessor engine | `galton_ultra.py` |
 | Docker build/run docs | `Dockerfile` (header comments) |
