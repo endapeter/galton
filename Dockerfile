@@ -1,4 +1,4 @@
-# CUDA build for galton_cuda.py.
+# CUDA build for the galton_cuda package.
 #
 # The NVIDIA *driver* comes from the Windows host through WSL2 (verified with
 # nvidia-smi inside WSL); the CUDA *toolkit* (nvcc / NVVM that Numba's CUDA
@@ -10,13 +10,13 @@
 # Run (mounts this folder into the container so figures/CSVs land on Windows):
 #   MSYS_NO_PATHCONV=1 docker run --rm --gpus all \
 #       -v "C:/Users/Enda/Data/Code/galton:/work" -w /work \
-#       galton-cuda python3 galton_cuda.py
+#       galton-cuda python3 -m galton_cuda
 #
 # Quick smoke test (200 balls, 2 sweep frames):
 #   MSYS_NO_PATHCONV=1 docker run --rm --gpus all \
 #       -v "C:/Users/Enda/Data/Code/galton:/work" -w /work \
 #       -e GALTON_BALLS=200 -e GALTON_INTERVALS=2 \
-#       galton-cuda python3 galton_cuda.py
+#       galton-cuda python3 -m galton_cuda
 
 FROM nvidia/cuda:12.4.1-devel-ubuntu22.04
 
@@ -37,4 +37,4 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Source and output are bind-mounted at runtime; nothing else to bake in.
-CMD ["python3", "galton_cuda.py"]
+CMD ["python3", "-m", "galton_cuda"]
