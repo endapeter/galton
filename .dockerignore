@@ -1,0 +1,11 @@
+# Keep the build context small: only requirements.txt is COPYied, but Docker
+# still uploads the whole context to the daemon without these excludes.
+*.ipynb
+*.pdf
+figures/
+related_works/
+archived/
+__pycache__/
+notes.txt
+*.txt
+!requirements.txt
