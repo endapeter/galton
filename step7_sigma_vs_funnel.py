@@ -11,9 +11,7 @@
 #
 # Run inside the CUDA container from the repository root (see CUDA_GUIDE.md):
 #
-#     MSYS_NO_PATHCONV=1 docker run --rm --gpus all \
-#         -v "C:/Users/Enda/Data/Code/galton:/work" -w /work \
-#         galton-cuda python3 sigma_vs_funnel.py
+#     docker run --rm --gpus all -v "C:/Users/Enda/Data/Code/galton:/work" -w /work galton-cuda python3 sigma_vs_funnel.py
 #
 # Smoke test (same env knobs as python3 -m galton_cuda):
 #

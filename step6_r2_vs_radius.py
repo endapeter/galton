@@ -17,9 +17,7 @@
 #
 # Run inside the CUDA container (see CUDA_GUIDE.md):
 #
-#   MSYS_NO_PATHCONV=1 docker run --rm --gpus all \
-#       -v "C:/Users/Enda/Data/Code/galton:/work" -w /work \
-#       galton-cuda python3 step6_r2_vs_radius.py
+#       docker run --rm --gpus all -v "C:/Users/Enda/Data/Code/galton:/work" -w /work galton-cuda python3 step6_r2_vs_radius.py
 #
 # Smoke test (fewer balls / radius steps, same env knobs as -m galton_cuda):
 #
