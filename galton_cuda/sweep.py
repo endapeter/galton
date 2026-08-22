@@ -53,16 +53,26 @@ def _check_param_names(names, context):
 # --- SINGLE FRAME: GPU batch + histogram + verification walk + Q-Q plot ---
 def run_frame(params, generated_circles, circles_centers, grid_data, grid_counts,
               min_cx, min_cy, wall_distance, n_balls, n_bins, frame_index,
-              param_name, param_val, csv_filename, output_dir="figures"):
+              param_name, param_val, csv_filename, output_dir="figures",
+              x_sampler=None):
     """
     Executes one sweep frame: n_balls in a single GPU kernel launch, then the
     histogram, the single-ball CPU verification walk, and the Q-Q plot.
     Returns a dict summarizing the frame (counts, bin edges, success rate...).
+
+    x_sampler: optional callable (n_balls, drop_min, drop_max) -> ndarray of
+        initial x positions. None (default) keeps the Stage-3 uniform
+        sampling x ~ U(drop_min, drop_max); e.g. the step-8 experiment passes
+        a Gaussian sampler x ~ N(0, sigma_in) instead.
     """
     os.makedirs(output_dir, exist_ok=True)
 
     drop_min, drop_max = params['X_DROP_RANGE']
-    x_init_values = np.random.uniform(drop_min, drop_max, size=n_balls)
+    if x_sampler is None:
+        x_init_values = np.random.uniform(drop_min, drop_max, size=n_balls)
+    else:
+        x_init_values = np.asarray(x_sampler(n_balls, drop_min, drop_max),
+                                   dtype=np.float64)
 
     final_x_positions = []
     final_positions_data = []
@@ -171,7 +181,7 @@ def run_frame(params, generated_circles, circles_centers, grid_data, grid_counts
 
 # --- SWEEP CONTROLLER ---
 def run_sweep(sweep_param, low, high, steps, fixed=None, n_balls=2000,
-              n_bins=200, output_dir="figures"):
+              n_bins=200, output_dir="figures", x_sampler=None):
     """
     Run a parameter sweep on the GPU.
 
@@ -189,6 +199,8 @@ def run_sweep(sweep_param, low, high, steps, fixed=None, n_balls=2000,
         n_balls: balls per frame (one GPU kernel launch per frame).
         n_bins: histogram bins.
         output_dir: directory for the PNGs and per-frame CSVs.
+        x_sampler: optional callable (n_balls, drop_min, drop_max) -> ndarray
+            overriding the Stage-3 uniform input sampling (see run_frame).
 
     Returns:
         List of per-frame result dicts (frame_index, param_val, n_success,
@@ -271,7 +283,8 @@ def run_sweep(sweep_param, low, high, steps, fixed=None, n_balls=2000,
             param_name=sweep_param,
             param_val=param_val,
             csv_filename=csv_filename,
-            output_dir=output_dir
+            output_dir=output_dir,
+            x_sampler=x_sampler
         ))
 
     print("\nSweep Complete! Images are saved sequentially in the "
