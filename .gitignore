@@ -1,3 +1,8 @@
-/figures
+figures/*
+!figures/.gitkeep
+
+brownian_test/*
+!brownian_test/.gitkeep
+
 /.claude/
 __pycache__/
