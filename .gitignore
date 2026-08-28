@@ -4,5 +4,9 @@ figures/*
 brownian_test/*
 !brownian_test/.gitkeep
 
+planning/
+!planning/markdown/
+!planning/problem.txt
+
 /.claude/
 __pycache__/
