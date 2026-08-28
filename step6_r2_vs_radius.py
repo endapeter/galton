@@ -64,9 +64,9 @@ def parse_args(argv=None):
                     "peg radius, one curve per peg distance "
                     "(run inside the CUDA container - see CUDA_GUIDE.md).")
     parser.add_argument("--distances", type=float, nargs='+',
-                        default=[2.0, 2.5, 3.0, 3.5, 4.0],
+                        default=[3.5, 4.0, 4.5, 5.0, 5.5],
                         help="peg DISTANCE values, one R²-vs-radius curve "
-                             "each (default: 2.0 2.5 3.0 3.5 4.0)")
+                             "each (default: 3.5 4.0 4.5 5.0 5.5)",)
     parser.add_argument("--radius-low", type=float, default=0.1,
                         help="first swept peg radius (default: 0.1)")
     parser.add_argument("--radius-high", type=float, default=0.7,
