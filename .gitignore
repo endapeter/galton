@@ -4,7 +4,7 @@ figures/*
 brownian_test/*
 !brownian_test/.gitkeep
 
-planning/
+planning/*
 !planning/markdown/
 !planning/problem.txt
 
