@@ -25,9 +25,12 @@ Important wall/peg-width behavior:
   geometry spacing, peg radius, and Brownian-model fitting logic are otherwise
   unchanged.
 
-Typical use, inside the CUDA container:
+Typical use, inside the CUDA container (see testing/README.md):
 
-    docker run --rm --gpus all -v "C:/Users/Enda/Data/Code/galton:/work" -w /work galton-cuda python3 test_brownian_model.py --drop-range 1.0 --wall-width 40 --balls 5000 --min-rows 5 --max-rows 50 --row-points 10
+    docker run --rm --gpus all -v "C:/Users/Enda/Data/Code/galton:/work" -w /work \
+        galton-cuda python3 testing/test_brownian_model.py \
+        --drop-range 1.0 --wall-width 40 --balls 5000 \
+        --min-rows 5 --max-rows 50 --row-points 10
 
 The effective height H is, by default,
 
@@ -37,6 +40,11 @@ where Delta_z = spacing * sqrt(3) / 2 is the vertical row spacing of the
 triangular peg lattice. This excludes constant non-peg fall distances such as
 h_init, which helps the intercept correspond to the initial release variance
 a^2 / 3.
+
+Figures are produced by the companion scripts:
+    figure1_variance_vs_funnel.py  (variance vs funnel width, height sweep per width)
+    figure2_variance_ratio.py      (out/in variance ratio at max height vs funnel width)
+    figure3_parameter_influence.py (theoretical H / D_z influence panels, one image)
 """
 
 import argparse
@@ -97,8 +105,7 @@ DEFAULTS = {
     "seed": 12345,            # RNG seed for 'random' sampling.
 
     # --- output ----------------------------------------------------------
-    "output": "brownian_test",  # Output directory for CSV/JSON/plots.
-    # no_plot: False            # Set True to skip matplotlib plots.
+    "output": "brownian_test",  # Output directory for CSV/JSON results.
 
     # --- acceptance thresholds ---------------------------------------------
     "r2_threshold": 0.95,         # Minimum R^2 of the free sigma^2-vs-H fit.
@@ -275,14 +282,8 @@ def parse_args(argv=None):
     out_group.add_argument(
         "--output",
         default=DEFAULTS["output"],
-        help="Output directory for CSV, JSON, and PNG/PDF results.",
+        help="Output directory for CSV and JSON results.",
     )
-    out_group.add_argument(
-        "--no-plot",
-        action="store_true",
-        help="Do not create matplotlib plots.",
-    )
-
     check_group = parser.add_argument_group("acceptance thresholds")
     check_group.add_argument(
         "--r2-threshold",
@@ -633,191 +634,6 @@ def write_json(path, payload):
         json.dump(payload, f, indent=2, default=_json_default)
 
 
-def make_multi_panel_plot(out_dir, records, fit, theory_intercept, args):
-    """
-    Creates a multi-panel diagnostic plot showing:
-
-    1. Prediction line overlay: data vs theoretical Brownian model.
-    2. Variance In vs Variance Out as a function of funnel width.
-    3a. Influence of H on variance as a function of funnel width.
-    3b. Influence of D_z on variance as a function of funnel width.
-
-    Saves both PNG and PDF formats.
-    """
-    try:
-        import matplotlib
-
-        matplotlib.use("Agg")
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        print(f"[plot] skipped because matplotlib is unavailable: {exc}")
-        return None, None
-
-    fig = plt.figure(figsize=(16, 12))
-    gs = fig.add_gridspec(2, 2, hspace=0.35, wspace=0.3)
-
-    H_data = np.array([r["H"] for r in records], dtype=np.float64)
-    sigma2_data = np.array([r["sigma2"] for r in records], dtype=np.float64)
-
-    a = float(args.drop_range)
-
-    Dz = fit.get("Dz_free")
-    if Dz is None or not math.isfinite(Dz) or Dz <= 0.0:
-        Dz = fit.get("Dz_fixed_theory")
-    if Dz is None or not math.isfinite(Dz) or Dz <= 0.0:
-        Dz = 0.1  # last-resort placeholder so the model curves still render
-
-    H_ref = float(np.mean(H_data)) if H_data.size > 0 else 10.0
-    if H_ref <= 0.0:
-        H_ref = 1.0
-
-    theory_var = float(theory_intercept)
-
-    # Plot 1: sigma^2 vs H
-    ax1 = fig.add_subplot(gs[0, 0])
-    ax1.scatter(
-        H_data,
-        sigma2_data,
-        color="tab:blue",
-        label="Data-informed actual variance",
-        zorder=3,
-        s=60,
-        edgecolor="black",
-    )
-
-    h_min = float(H_data.min()) if H_data.size > 0 else 0.1
-    h_max = float(H_data.max()) if H_data.size > 0 else 10.0
-    h_lo = max(0.1, h_min)
-    h_hi = max(h_lo * 1.1, h_max * 1.1)
-    H_fit = np.linspace(h_lo, h_hi, 100)
-
-    ax1.plot(
-        H_fit,
-        theory_var + 2.0 * Dz * H_fit,
-        color="tab:red",
-        label=r"Model line: $a^2/3 + 2\,D_z H$ (fitted $D_z$)",
-        lw=2,
-    )
-    ax1.axhline(
-        theory_var,
-        color="tab:green",
-        linestyle="--",
-        label="Uniform reference input variance ($a^2/3$)",
-        lw=2,
-    )
-    ax1.set_xlabel("Effective Height ($H$)", fontsize=12)
-    ax1.set_ylabel(r"Variance ($\sigma^2$)", fontsize=12)
-    ax1.set_title("1. Variance vs Height (Prediction vs Data)", fontsize=14)
-    ax1.legend(fontsize=10)
-    ax1.grid(True, alpha=0.3)
-
-    # Plot 2: Variance In vs Variance Out vs funnel width
-    ax2 = fig.add_subplot(gs[0, 1])
-    W_max = max(4.0 * a, 4.0)
-    W = np.linspace(0.1, W_max, 100)
-    var_in = (W**2) / 12.0
-    var_out_theory = var_in + 2.0 * Dz * H_ref
-
-    ax2.plot(
-        W,
-        var_in,
-        color="tab:green",
-        linestyle="--",
-        label=r"Variance In ($W^2/12$)",
-        lw=2,
-    )
-    ax2.plot(
-        W,
-        var_out_theory,
-        color="tab:red",
-        label="Variance Out (Theoretical)",
-        lw=2,
-    )
-
-    if H_data.size > 0:
-        ax2.scatter(
-            [2.0 * a],
-            [theory_var],
-            color="tab:green",
-            edgecolor="black",
-            zorder=4,
-            s=80,
-            label="Simulated Variance In",
-        )
-        ax2.scatter(
-            [2.0 * a],
-            [theory_var + 2.0 * Dz * H_ref],
-            color="tab:red",
-            edgecolor="black",
-            zorder=4,
-            s=80,
-            label="Variance Out (model, at mean H)",
-        )
-
-    ax2.set_xlabel(r"Funnel Width ($W = 2a$)", fontsize=12)
-    ax2.set_ylabel("Variance", fontsize=12)
-    ax2.set_title("2. Variance In vs Out as Function of Funnel Width", fontsize=14)
-    ax2.legend(fontsize=10)
-    ax2.grid(True, alpha=0.3)
-
-    baseline_var = (W**2) / 12.0
-
-    # Plot 3a: Influence of H on variance vs funnel width
-    ax3 = fig.add_subplot(gs[1, 0])
-    H_levels = [H_ref * 0.5, H_ref, H_ref * 1.5, H_ref * 2.0]
-    colors_H = plt.cm.viridis(np.linspace(0.2, 0.8, len(H_levels)))
-
-    for i, h_val in enumerate(H_levels):
-        var_vs_W = (W**2) / 12.0 + 2.0 * Dz * h_val
-        ax3.plot(W, var_vs_W, color=colors_H[i], lw=2, label=f"$H = {h_val:.1f}$")
-
-    ax3.plot(
-        W,
-        baseline_var,
-        "k--",
-        alpha=0.6,
-        lw=2,
-        label=r"Influence of $a$ only ($W^2/12$)",
-    )
-    ax3.set_xlabel(r"Funnel Width ($W = 2a$)", fontsize=12)
-    ax3.set_ylabel(r"Variance ($\sigma^2$)", fontsize=12)
-    ax3.set_title(r"3a. Influence of $H$ on Variance vs Funnel Width", fontsize=14)
-    ax3.legend(fontsize=10)
-    ax3.grid(True, alpha=0.3)
-
-    # Plot 3b: Influence of D_z on variance vs funnel width
-    ax4 = fig.add_subplot(gs[1, 1])
-    D_levels = [Dz * 0.5, Dz, Dz * 1.5, Dz * 2.0]
-    colors_D = plt.cm.plasma(np.linspace(0.2, 0.8, len(D_levels)))
-
-    for i, d_val in enumerate(D_levels):
-        var_vs_W = (W**2) / 12.0 + 2.0 * d_val * H_ref
-        ax4.plot(W, var_vs_W, color=colors_D[i], lw=2, label=f"$D_z = {d_val:.2f}$")
-
-    ax4.plot(
-        W,
-        baseline_var,
-        "k--",
-        alpha=0.6,
-        lw=2,
-        label=r"Influence of $a$ only ($W^2/12$)",
-    )
-    ax4.set_xlabel(r"Funnel Width ($W = 2a$)", fontsize=12)
-    ax4.set_ylabel(r"Variance ($\sigma^2$)", fontsize=12)
-    ax4.set_title(r"3b. Influence of $D_z$ on Variance vs Funnel Width", fontsize=14)
-    ax4.legend(fontsize=10)
-    ax4.grid(True, alpha=0.3)
-
-    png_path = out_dir / "brownian_model_multi_panel.png"
-    pdf_path = out_dir / "brownian_model_multi_panel.pdf"
-
-    fig.savefig(png_path, dpi=300, bbox_inches="tight")
-    fig.savefig(pdf_path, format="pdf", bbox_inches="tight")
-    plt.close(fig)
-
-    return png_path, pdf_path
-
-
 def fmt(x, spec=".6g"):
     try:
         if x is None or not math.isfinite(x):
@@ -1131,16 +947,6 @@ def main(argv=None):
     json_path = out_dir / "brownian_model_summary.json"
     write_json(json_path, payload)
 
-    png_path, pdf_path = (None, None)
-    if not args.no_plot:
-        png_path, pdf_path = make_multi_panel_plot(
-            out_dir,
-            records,
-            fit,
-            theory_initial_variance,
-            args,
-        )
-
     print_report(
         args=args,
         records=records,
@@ -1155,10 +961,6 @@ def main(argv=None):
     print("\nOutput files:")
     print(f"  CSV   : {csv_path}")
     print(f"  JSON  : {json_path}")
-    if png_path is not None:
-        print(f"  Plot (PNG) : {png_path}")
-    if pdf_path is not None:
-        print(f"  Plot (PDF) : {pdf_path}")
 
     return 0
 
